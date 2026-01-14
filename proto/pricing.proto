@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package pricing;
+
+option go_package = "./pricingpb";
+
+// PricingService - บริการคำนวณราคาค่าโดยสาร
+service PricingService {
+  // CalculatePrice - คำนวณราคาจากจุดรับและจุดส่ง
+  rpc CalculatePrice(PriceRequest) returns (PriceResponse);
+}
+
+// PriceRequest - ข้อมูลสำหรับคำนวณราคา
+message PriceRequest {
+  double pickup_lat = 1;   // ละติจูดจุดรับ
+  double pickup_lng = 2;   // ลองจิจูดจุดรับ
+  double dropoff_lat = 3;  // ละติจูดจุดส่ง
+  double dropoff_lng = 4;  // ลองจิจูดจุดส่ง
+}
+
+// PriceResponse - ผลการคำนวณราคา
+message PriceResponse {
+  double total = 1;         // ราคารวม (บาท)
+  double base_fare = 2;     // ค่าเริ่มต้น
+  double distance_fee = 3;  // ค่าระยะทาง
+  double distance_km = 4;   // ระยะทาง (กม.)
+  string currency = 5;      // สกุลเงิน
+}
