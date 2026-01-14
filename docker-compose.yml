@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # =========================================
   # Databases (Database per Service Pattern)
@@ -22,9 +20,10 @@ services:
       - ride-hailing-network
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U matching_user -d matching_db"]
-      interval: 5s
+      interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 30s
 
   # MongoDB for Pricing Service
   pricing-db:
@@ -43,9 +42,10 @@ services:
       - ride-hailing-network
     healthcheck:
       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 5s
+      interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 30s
 
   # PostgreSQL for Payment Service
   payment-db:
@@ -64,9 +64,10 @@ services:
       - ride-hailing-network
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U payment_user -d payment_db"]
-      interval: 5s
+      interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 30s
 
   # =========================================
   # Infrastructure

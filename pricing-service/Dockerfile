@@ -7,10 +7,16 @@ RUN apk add --no-cache git
 
 # Copy go mod files
 COPY go.mod ./
-RUN go mod download
+
+# Download dependencies and generate go.sum
+RUN go mod download || true
+RUN go mod tidy
 
 # Copy source
 COPY . .
+
+# Tidy again after copying all source
+RUN go mod tidy
 
 # Build
 RUN CGO_ENABLED=0 GOOS=linux go build -o pricing-service .
