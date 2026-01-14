@@ -251,6 +251,40 @@ app.get("/health", async (req, res) => {
 });
 
 // =========================================
+// Resilience Logic: Fallback Pricing
+// =========================================
+function calculateFallbackPrice(pickup, dropoff) {
+  // Simple Haversine Distance (copied logic for fallback)
+  const R = 6371; // Earth radius in km
+  const dLat = ((dropoff.lat - pickup.lat) * Math.PI) / 180;
+  const dLng = ((dropoff.lng - pickup.lng) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos((pickup.lat * Math.PI) / 180) *
+      Math.cos((dropoff.lat * Math.PI) / 180) *
+      Math.sin(dLng / 2) *
+      Math.sin(dLng / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  const distanceKm = R * c;
+
+  // Static Fallback Rules
+  const BASE_FARE = 30; // แพงกว่าปกติหน่อย (Penalty) หรือ Safety margin
+  const PER_KM = 8;
+  const total = Math.ceil(BASE_FARE + distanceKm * PER_KM);
+
+  return {
+    total: total,
+    currency: "THB",
+    source: "fallback (matching local)", // ระบุที่มา
+    breakdown: {
+      baseFare: BASE_FARE,
+      distanceFee: Math.ceil(distanceKm * PER_KM),
+      distanceKm: distanceKm,
+    },
+  };
+}
+
+// =========================================
 // Main Endpoint: Request Ride
 // =========================================
 app.post("/request-ride", async (req, res) => {
@@ -261,7 +295,7 @@ app.post("/request-ride", async (req, res) => {
   console.log(`   🎯 Dropoff: ${JSON.stringify(dropoffLocation)}`);
 
   try {
-    // 1. Find available driver (from DB or fallback)
+    // 1. Find available driver
     let driver;
     if (dbPool) {
       driver = await getAvailableDriver();
@@ -282,9 +316,11 @@ app.post("/request-ride", async (req, res) => {
       })`
     );
 
-    // 2. Call Pricing Service (gRPC)
+    // 2. Pricing Strategy (Resilience Pattern)
+    // Try gRPC -> Fail -> Try HTTP -> Fail -> Use Fallback
     let pricing;
     try {
+      console.log(`📡 [Matching] Asking Pricing Service (gRPC)...`);
       const grpcResponse = await calculatePriceGrpc(
         pickupLocation,
         dropoffLocation
@@ -292,6 +328,7 @@ app.post("/request-ride", async (req, res) => {
       pricing = {
         total: grpcResponse.total,
         currency: grpcResponse.currency || "THB",
+        source: "pricing-service (gRPC)",
         breakdown: {
           baseFare: grpcResponse.base_fare,
           distanceFee: grpcResponse.distance_fee,
@@ -300,14 +337,28 @@ app.post("/request-ride", async (req, res) => {
       };
       console.log(`✅ [Matching] Got price from gRPC: ${pricing.total} THB`);
     } catch (grpcErr) {
-      console.log(`⚠️ [Matching] gRPC failed, using fallback HTTP`);
-      const pricingUrl =
-        process.env.PRICING_HTTP_URL || "http://pricing-service:3002";
-      const httpResponse = await axios.post(`${pricingUrl}/calculate`, {
-        pickupLocation,
-        dropoffLocation,
-      });
-      pricing = httpResponse.data;
+      console.warn(
+        `⚠️ [Matching] gRPC failed (${grpcErr.message}). Trying HTTP fallback...`
+      );
+
+      try {
+        const pricingUrl =
+          process.env.PRICING_HTTP_URL || "http://pricing-service:3002";
+        const httpResponse = await axios.post(`${pricingUrl}/calculate`, {
+          pickupLocation,
+          dropoffLocation,
+        });
+        pricing = { ...httpResponse.data, source: "pricing-service (HTTP)" };
+        console.log(`✅ [Matching] Got price from HTTP: ${pricing.total} THB`);
+      } catch (httpErr) {
+        console.error(
+          `❌ [Matching] HTTP failed too (${httpErr.message}). Using Local Fallback!`
+        );
+
+        // FINAL FALLBACK: Calculate locally
+        pricing = calculateFallbackPrice(pickupLocation, dropoffLocation);
+        console.log(`🛡️ [Matching] Used Fallback Price: ${pricing.total} THB`);
+      }
     }
 
     // 3. Create ride record
@@ -328,7 +379,7 @@ app.post("/request-ride", async (req, res) => {
       createdAt: new Date().toISOString(),
     };
 
-    // 4. Process Payment (HTTP call)
+    // 4. Process Payment
     let payment;
     try {
       const paymentUrl =
@@ -343,7 +394,7 @@ app.post("/request-ride", async (req, res) => {
       console.log(`✅ [Matching] Payment processed: ${payment.paymentId}`);
     } catch (payErr) {
       console.error("❌ [Matching] Payment failed:", payErr.message);
-      // Release driver
+      // Rollback driver
       if (dbPool) await updateDriverAvailability(driver.id, true);
       else driver.available = true;
       return res.status(500).json({ error: "Payment processing failed" });
@@ -353,7 +404,6 @@ app.post("/request-ride", async (req, res) => {
     ride.payment = payment;
     ride.status = "confirmed";
 
-    // Save to database or fallback
     if (dbPool) {
       await createRide(ride);
       console.log(`💾 [Matching] Ride saved to PostgreSQL`);
