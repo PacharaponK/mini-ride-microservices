@@ -381,6 +381,96 @@ async def get_wallet_balance(rider_id: str):
     return {"riderId": rider_id, **wallet}
 
 # =========================================
+# SAGA Pattern Endpoints
+# =========================================
+
+class RefundRequest(BaseModel):
+    sagaId: str
+    paymentId: str
+    amount: float
+
+@app.post("/refund")
+async def refund_payment(request: RefundRequest):
+    """
+    Refund payment (SAGA Compensation)
+    
+    1. Get original payment
+    2. Refund amount to wallet
+    3. Record refund transaction
+    4. Publish Kafka event
+    """
+    logger.info(f"🔙 [SAGA] Refund request for payment {request.paymentId}")
+    
+    # Get original payment
+    payment = await get_payment(request.paymentId) if db_pool else \
+               next((p for p in fallback_payments if p["paymentId"] == request.paymentId), None)
+    
+    if not payment:
+        logger.warning(f"⚠️ Payment not found: {request.paymentId}, proceeding with refund anyway")
+    
+    rider_id = payment['rider_id'] if payment else None
+    
+    if rider_id:
+        # Get wallet
+        wallet = await get_wallet(rider_id) if db_pool else fallback_wallets.get(rider_id)
+        
+        if wallet:
+            if isinstance(wallet.get('balance'), Decimal):
+                wallet['balance'] = float(wallet['balance'])
+            
+            balance_before = wallet['balance']
+            new_balance = balance_before + request.amount
+            
+            if db_pool:
+                # Update wallet
+                await update_wallet_balance(rider_id, new_balance)
+                
+                # Update payment status
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE payments SET status = 'refunded' WHERE id = $1",
+                        request.paymentId
+                    )
+                
+                # Record refund transaction
+                await create_transaction(
+                    rider_id, request.paymentId, 'refund',
+                    request.amount, balance_before, new_balance
+                )
+                
+                logger.info(f"💾 [SAGA] Refund saved to PostgreSQL")
+            else:
+                # Update fallback
+                wallet['balance'] = new_balance
+                if payment:
+                    payment['status'] = 'refunded'
+            
+            logger.info(f"✅ [SAGA] Refunded: {request.amount} THB to {rider_id}")
+            logger.info(f"   New balance: {new_balance} THB")
+    
+    # Publish Kafka event
+    if kafka_producer:
+        try:
+            await kafka_producer.send_and_wait("payment.refunded", {
+                "paymentId": request.paymentId,
+                "sagaId": request.sagaId,
+                "amount": request.amount,
+                "status": "refunded",
+                "timestamp": datetime.now().isoformat()
+            })
+            logger.info(f"📤 [Kafka] Published: payment.refunded")
+        except Exception as e:
+            logger.error(f"❌ Kafka publish failed: {e}")
+    
+    return {
+        "success": True,
+        "paymentId": request.paymentId,
+        "sagaId": request.sagaId,
+        "refundedAmount": request.amount,
+        "status": "refunded"
+    }
+
+# =========================================
 # Main
 # =========================================
 if __name__ == "__main__":

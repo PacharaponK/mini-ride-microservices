@@ -439,6 +439,136 @@ app.get("/rides", async (req, res) => {
 });
 
 // =========================================
+// SAGA Pattern Endpoints
+// =========================================
+
+// Reserve driver (SAGA Step 1)
+app.post("/reserve-driver", async (req, res) => {
+  const { sagaId, riderId, pickupLocation } = req.body;
+  console.log(`\n🎭 [SAGA] Reserve driver request for saga ${sagaId}`);
+
+  try {
+    let driver;
+    if (dbPool) {
+      driver = await getAvailableDriver();
+      if (driver) {
+        await updateDriverAvailability(driver.id, false);
+      }
+    } else {
+      driver = fallbackDrivers.find((d) => d.available);
+      if (driver) driver.available = false;
+    }
+
+    if (!driver) {
+      return res.status(503).json({ error: "No drivers available" });
+    }
+
+    console.log(`✅ [SAGA] Driver reserved: ${driver.name}`);
+    res.json({
+      sagaId,
+      driverId: driver.id,
+      driver: {
+        id: driver.id,
+        name: driver.name,
+        vehicle: driver.vehicle,
+        plate: driver.plate,
+      },
+    });
+  } catch (err) {
+    console.error(`❌ [SAGA] Reserve driver failed: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Release driver (SAGA Compensation)
+app.post("/release-driver", async (req, res) => {
+  const { sagaId, driverId } = req.body;
+  console.log(`\n🔙 [SAGA] Release driver ${driverId} for saga ${sagaId}`);
+
+  try {
+    if (dbPool) {
+      await updateDriverAvailability(driverId, true);
+    } else {
+      const driver = fallbackDrivers.find((d) => d.id === driverId);
+      if (driver) driver.available = true;
+    }
+
+    console.log(`✅ [SAGA] Driver released: ${driverId}`);
+    res.json({ success: true, driverId });
+  } catch (err) {
+    console.error(`❌ [SAGA] Release driver failed: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Confirm ride (SAGA Step 4)
+app.post("/confirm-ride", async (req, res) => {
+  const {
+    sagaId,
+    riderId,
+    driverId,
+    driver,
+    pickupLocation,
+    dropoffLocation,
+    pricing,
+    payment,
+  } = req.body;
+  console.log(`\n✅ [SAGA] Confirm ride for saga ${sagaId}`);
+
+  try {
+    const rideId = sagaId; // Use saga ID as ride ID for traceability
+    const ride = {
+      rideId,
+      riderId,
+      driver,
+      pickupLocation,
+      dropoffLocation,
+      pricing,
+      payment,
+      status: "confirmed",
+      createdAt: new Date().toISOString(),
+    };
+
+    if (dbPool) {
+      await createRide(ride);
+      console.log(`💾 [SAGA] Ride saved to PostgreSQL`);
+    } else {
+      fallbackRides.push(ride);
+    }
+
+    console.log(`✅ [SAGA] Ride confirmed: ${rideId}`);
+    res.json(ride);
+  } catch (err) {
+    console.error(`❌ [SAGA] Confirm ride failed: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Cancel ride (SAGA Compensation)
+app.post("/cancel-ride", async (req, res) => {
+  const { sagaId, rideId } = req.body;
+  console.log(`\n🔙 [SAGA] Cancel ride ${rideId} for saga ${sagaId}`);
+
+  try {
+    if (dbPool) {
+      await dbPool.query("UPDATE rides SET status = $1 WHERE id = $2", [
+        "cancelled",
+        rideId,
+      ]);
+    } else {
+      const ride = fallbackRides.find((r) => r.rideId === rideId);
+      if (ride) ride.status = "cancelled";
+    }
+
+    console.log(`✅ [SAGA] Ride cancelled: ${rideId}`);
+    res.json({ success: true, rideId });
+  } catch (err) {
+    console.error(`❌ [SAGA] Cancel ride failed: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// =========================================
 // Start Server
 // =========================================
 app.listen(PORT, async () => {

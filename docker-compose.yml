@@ -226,6 +226,88 @@ services:
     restart: unless-stopped
 
   # =========================================
+  # SAGA Orchestrator
+  # =========================================
+
+  # MongoDB for Saga State
+  saga-db:
+    image: mongo:7
+    container_name: saga-db
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: saga_user
+      MONGO_INITDB_ROOT_PASSWORD: saga_pass
+      MONGO_INITDB_DATABASE: saga_db
+    ports:
+      - "27018:27017"
+    volumes:
+      - saga-db-data:/data/db
+    networks:
+      - ride-hailing-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # Saga Orchestrator Service
+  saga-orchestrator:
+    build:
+      context: ./saga-orchestrator
+      dockerfile: Dockerfile
+    container_name: saga-orchestrator
+    ports:
+      - "3004:3004"
+    environment:
+      - PORT=3004
+      - MONGO_URL=mongodb://saga_user:saga_pass@saga-db:27017/saga_db?authSource=admin
+      - MATCHING_SERVICE_URL=http://matching-service:3001
+      - PRICING_SERVICE_HOST=pricing-service:50051
+      - PAYMENT_SERVICE_URL=http://payment-service:3003
+      - KAFKA_BROKER=kafka:9092
+      - PROTO_PATH=/app/proto/pricing.proto
+    volumes:
+      - ./proto:/app/proto:ro
+    depends_on:
+      saga-db:
+        condition: service_healthy
+      matching-service:
+        condition: service_started
+      pricing-service:
+        condition: service_started
+      payment-service:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+    networks:
+      - ride-hailing-network
+    restart: unless-stopped
+
+  # =========================================
+  # Notification Service
+  # =========================================
+
+  # Notification Service (Python/FastAPI + Kafka Consumer)
+  notification-service:
+    build:
+      context: ./notification-service
+      dockerfile: Dockerfile
+    container_name: notification-service
+    ports:
+      - "3005:3005"
+    environment:
+      - PORT=3005
+      - KAFKA_BROKER=kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+      payment-service:
+        condition: service_started
+    networks:
+      - ride-hailing-network
+    restart: unless-stopped
+
+  # =========================================
   # Frontend
   # =========================================
 
@@ -252,6 +334,7 @@ volumes:
   matching-db-data:
   pricing-db-data:
   payment-db-data:
+  saga-db-data:
 
 # =========================================
 # Networks
