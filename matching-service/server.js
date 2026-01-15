@@ -1,9 +1,6 @@
 import express from "express";
 import { v4 as uuidv4 } from "uuid";
-import * as grpc from "@grpc/grpc-js";
-import * as protoLoader from "@grpc/proto-loader";
 import { Kafka } from "kafkajs";
-import axios from "axios";
 import pg from "pg";
 
 const { Pool } = pg;
@@ -130,58 +127,6 @@ const fallbackDrivers = [
 const fallbackRides = [];
 
 // =========================================
-// gRPC Client (Pricing Service)
-// =========================================
-let pricingClient = null;
-
-function initGrpcClient() {
-  try {
-    const PROTO_PATH = process.env.PROTO_PATH || "/app/proto/pricing.proto";
-    const packageDefinition = protoLoader.loadSync(PROTO_PATH, {
-      keepCase: true,
-      longs: String,
-      enums: String,
-      defaults: true,
-      oneofs: true,
-    });
-
-    const pricingProto = grpc.loadPackageDefinition(packageDefinition).pricing;
-    const PRICING_HOST =
-      process.env.PRICING_SERVICE_HOST || "pricing-service:50051";
-
-    pricingClient = new pricingProto.PricingService(
-      PRICING_HOST,
-      grpc.credentials.createInsecure()
-    );
-    console.log(`✅ gRPC client connected to ${PRICING_HOST}`);
-  } catch (err) {
-    console.error("❌ gRPC client init failed:", err.message);
-  }
-}
-
-function calculatePriceGrpc(pickup, dropoff) {
-  return new Promise((resolve, reject) => {
-    if (!pricingClient) {
-      reject(new Error("gRPC client not initialized"));
-      return;
-    }
-
-    pricingClient.CalculatePrice(
-      {
-        pickup_lat: pickup.lat,
-        pickup_lng: pickup.lng,
-        dropoff_lat: dropoff.lat,
-        dropoff_lng: dropoff.lng,
-      },
-      (err, response) => {
-        if (err) reject(err);
-        else resolve(response);
-      }
-    );
-  });
-}
-
-// =========================================
 // Kafka Consumer (Payment Events)
 // =========================================
 let kafkaConsumer = null;
@@ -244,181 +189,14 @@ app.get("/health", async (req, res) => {
     service: "matching-service",
     status: "healthy",
     database: dbStatus,
-    grpcConnected: !!pricingClient,
     kafkaConnected: !!kafkaConsumer,
     timestamp: new Date().toISOString(),
   });
 });
 
 // =========================================
-// Resilience Logic: Fallback Pricing
+// Query Endpoints
 // =========================================
-function calculateFallbackPrice(pickup, dropoff) {
-  // Simple Haversine Distance (copied logic for fallback)
-  const R = 6371; // Earth radius in km
-  const dLat = ((dropoff.lat - pickup.lat) * Math.PI) / 180;
-  const dLng = ((dropoff.lng - pickup.lng) * Math.PI) / 180;
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos((pickup.lat * Math.PI) / 180) *
-      Math.cos((dropoff.lat * Math.PI) / 180) *
-      Math.sin(dLng / 2) *
-      Math.sin(dLng / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  const distanceKm = R * c;
-
-  // Static Fallback Rules
-  const BASE_FARE = 30; // แพงกว่าปกติหน่อย (Penalty) หรือ Safety margin
-  const PER_KM = 8;
-  const total = Math.ceil(BASE_FARE + distanceKm * PER_KM);
-
-  return {
-    total: total,
-    currency: "THB",
-    source: "fallback (matching local)", // ระบุที่มา
-    breakdown: {
-      baseFare: BASE_FARE,
-      distanceFee: Math.ceil(distanceKm * PER_KM),
-      distanceKm: distanceKm,
-    },
-  };
-}
-
-// =========================================
-// Main Endpoint: Request Ride
-// =========================================
-app.post("/request-ride", async (req, res) => {
-  const { riderId, pickupLocation, dropoffLocation } = req.body;
-
-  console.log(`\n🚗 [Matching] New ride request from ${riderId}`);
-  console.log(`   📍 Pickup: ${JSON.stringify(pickupLocation)}`);
-  console.log(`   🎯 Dropoff: ${JSON.stringify(dropoffLocation)}`);
-
-  try {
-    // 1. Find available driver
-    let driver;
-    if (dbPool) {
-      driver = await getAvailableDriver();
-      if (driver) {
-        await updateDriverAvailability(driver.id, false);
-      }
-    } else {
-      driver = fallbackDrivers.find((d) => d.available);
-      if (driver) driver.available = false;
-    }
-
-    if (!driver) {
-      return res.status(503).json({ error: "No drivers available" });
-    }
-    console.log(
-      `✅ [Matching] Assigned driver: ${driver.name} (from ${
-        dbPool ? "PostgreSQL" : "memory"
-      })`
-    );
-
-    // 2. Pricing Strategy (Resilience Pattern)
-    // Try gRPC -> Fail -> Try HTTP -> Fail -> Use Fallback
-    let pricing;
-    try {
-      console.log(`📡 [Matching] Asking Pricing Service (gRPC)...`);
-      const grpcResponse = await calculatePriceGrpc(
-        pickupLocation,
-        dropoffLocation
-      );
-      pricing = {
-        total: grpcResponse.total,
-        currency: grpcResponse.currency || "THB",
-        source: "pricing-service (gRPC)",
-        breakdown: {
-          baseFare: grpcResponse.base_fare,
-          distanceFee: grpcResponse.distance_fee,
-          distanceKm: grpcResponse.distance_km,
-        },
-      };
-      console.log(`✅ [Matching] Got price from gRPC: ${pricing.total} THB`);
-    } catch (grpcErr) {
-      console.warn(
-        `⚠️ [Matching] gRPC failed (${grpcErr.message}). Trying HTTP fallback...`
-      );
-
-      try {
-        const pricingUrl =
-          process.env.PRICING_HTTP_URL || "http://pricing-service:3002";
-        const httpResponse = await axios.post(`${pricingUrl}/calculate`, {
-          pickupLocation,
-          dropoffLocation,
-        });
-        pricing = { ...httpResponse.data, source: "pricing-service (HTTP)" };
-        console.log(`✅ [Matching] Got price from HTTP: ${pricing.total} THB`);
-      } catch (httpErr) {
-        console.error(
-          `❌ [Matching] HTTP failed too (${httpErr.message}). Using Local Fallback!`
-        );
-
-        // FINAL FALLBACK: Calculate locally
-        pricing = calculateFallbackPrice(pickupLocation, dropoffLocation);
-        console.log(`🛡️ [Matching] Used Fallback Price: ${pricing.total} THB`);
-      }
-    }
-
-    // 3. Create ride record
-    const rideId = `ride-${uuidv4().slice(0, 8)}`;
-    const ride = {
-      rideId,
-      riderId,
-      driver: {
-        id: driver.id,
-        name: driver.name,
-        vehicle: driver.vehicle,
-        plate: driver.plate,
-      },
-      pickupLocation,
-      dropoffLocation,
-      pricing,
-      status: "matched",
-      createdAt: new Date().toISOString(),
-    };
-
-    // 4. Process Payment
-    let payment;
-    try {
-      const paymentUrl =
-        process.env.PAYMENT_SERVICE_URL || "http://payment-service:3003";
-      const paymentResponse = await axios.post(`${paymentUrl}/process`, {
-        rideId,
-        riderId,
-        amount: pricing.total,
-        currency: pricing.currency,
-      });
-      payment = paymentResponse.data;
-      console.log(`✅ [Matching] Payment processed: ${payment.paymentId}`);
-    } catch (payErr) {
-      console.error("❌ [Matching] Payment failed:", payErr.message);
-      // Rollback driver
-      if (dbPool) await updateDriverAvailability(driver.id, true);
-      else driver.available = true;
-      return res.status(500).json({ error: "Payment processing failed" });
-    }
-
-    // 5. Finalize ride
-    ride.payment = payment;
-    ride.status = "confirmed";
-
-    if (dbPool) {
-      await createRide(ride);
-      console.log(`💾 [Matching] Ride saved to PostgreSQL`);
-    } else {
-      fallbackRides.push(ride);
-    }
-
-    console.log(`✅ [Matching] Ride confirmed: ${rideId}\n`);
-
-    res.json(ride);
-  } catch (err) {
-    console.error("❌ [Matching] Error:", err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
 
 // Get ride by ID
 app.get("/rides/:id", async (req, res) => {
@@ -576,9 +354,6 @@ app.listen(PORT, async () => {
 
   // Initialize PostgreSQL
   await initDatabase();
-
-  // Initialize gRPC client
-  setTimeout(() => initGrpcClient(), 2000);
 
   // Initialize Kafka consumer
   setTimeout(() => initKafkaConsumer(), 5000);

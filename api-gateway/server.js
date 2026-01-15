@@ -20,26 +20,48 @@ app.get("/health", (req, res) => {
   });
 });
 
-// Proxy to Matching Service
+// Proxy to Saga Orchestrator (ride booking via SAGA)
 app.use(
-  "/api",
+  "/api/saga",
   createProxyMiddleware({
-    target: process.env.MATCHING_SERVICE_URL || "http://matching-service:3001",
+    target: process.env.SAGA_SERVICE_URL || "http://saga-orchestrator:3004",
     changeOrigin: true,
-    pathRewrite: { "^/api": "" },
+    pathRewrite: { "^/api/saga": "/saga" },
     onProxyReq: (proxyReq, req, res) => {
-      // Log incoming requests
       console.log(
-        `[Gateway] ${req.method} ${req.originalUrl} -> Matching Service`
+        `[Gateway] ${req.method} ${req.originalUrl} -> Saga Orchestrator`
       );
-
-      // Forward JSON body
       if (req.body && Object.keys(req.body).length > 0) {
         const bodyData = JSON.stringify(req.body);
         proxyReq.setHeader("Content-Type", "application/json");
         proxyReq.setHeader("Content-Length", Buffer.byteLength(bodyData));
         proxyReq.write(bodyData);
       }
+    },
+    onProxyRes: (proxyRes, req, res) => {
+      console.log(`[Gateway] Response: ${proxyRes.statusCode}`);
+    },
+    onError: (err, req, res) => {
+      console.error("[Gateway] Proxy error:", err.message);
+      res.status(502).json({
+        error: "Bad Gateway",
+        message: "Unable to connect to Saga Orchestrator",
+      });
+    },
+  })
+);
+
+// Proxy to Matching Service (ride queries only)
+app.use(
+  "/api/rides",
+  createProxyMiddleware({
+    target: process.env.MATCHING_SERVICE_URL || "http://matching-service:3001",
+    changeOrigin: true,
+    pathRewrite: { "^/api/rides": "/rides" },
+    onProxyReq: (proxyReq, req, res) => {
+      console.log(
+        `[Gateway] ${req.method} ${req.originalUrl} -> Matching Service`
+      );
     },
     onProxyRes: (proxyRes, req, res) => {
       console.log(`[Gateway] Response: ${proxyRes.statusCode}`);

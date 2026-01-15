@@ -185,18 +185,28 @@ docker-compose down -v
 
 ```
 GET  /health              - Health check
-ALL  /api/*               - Proxy to Matching Service
+ALL  /api/saga/*          - Proxy to Saga Orchestrator
+ALL  /api/rides/*         - Proxy to Matching Service (queries)
 ```
 
 #### Code Highlights
 
 ```javascript
-// Proxy configuration
+// Proxy to Saga Orchestrator
 app.use(
-  "/api",
+  "/api/saga",
+  createProxyMiddleware({
+    target: "http://saga-orchestrator:3004",
+    pathRewrite: { "^/api/saga": "/saga" },
+  })
+);
+
+// Proxy to Matching Service (rides queries)
+app.use(
+  "/api/rides",
   createProxyMiddleware({
     target: "http://matching-service:3001",
-    pathRewrite: { "^/api": "" },
+    pathRewrite: { "^/api/rides": "/rides" },
   })
 );
 ```
@@ -246,11 +256,10 @@ CREATE TABLE rides (
 
 ```
 GET   /health              - Health check
-POST  /request-ride        - เรียกรถ (full flow)
 GET   /rides               - List all rides
 GET   /rides/:id           - Get ride by ID
 
-# SAGA Endpoints
+# SAGA Participant Endpoints (called by Saga Orchestrator)
 POST  /reserve-driver      - จอง driver (Step 1)
 POST  /release-driver      - คืน driver (Compensation)
 POST  /confirm-ride        - ยืนยัน ride (Step 4)
@@ -259,9 +268,10 @@ POST  /cancel-ride         - ยกเลิก ride (Compensation)
 
 #### Communication
 
-- **gRPC** → Pricing Service (คำนวณราคา)
-- **HTTP** → Payment Service (ชำระเงิน)
 - **Kafka Consumer** → รับ payment.completed events
+
+> **Note**: Matching Service ทำหน้าที่เป็น SAGA Participant เท่านั้น
+> การจองรถทั้งหมดต้องผ่าน Saga Orchestrator
 
 ---
 
@@ -681,14 +691,17 @@ INITIATED → RESERVING_DRIVER → CALCULATING_PRICE → PROCESSING_PAYMENT → 
 # Health check
 curl http://localhost:3000/health
 
-# Request ride (proxied to Matching)
-curl -X POST http://localhost:3000/api/request-ride \
+# Request ride via SAGA (recommended)
+curl -X POST http://localhost:3000/api/saga/ride-booking \
   -H "Content-Type: application/json" \
   -d '{
     "riderId": "rider-001",
     "pickupLocation": {"lat": 13.7563, "lng": 100.5018},
     "dropoffLocation": {"lat": 13.7469, "lng": 100.5349}
   }'
+
+# List all rides
+curl http://localhost:3000/api/rides
 ```
 
 ### Saga Orchestrator (Port 3004)
